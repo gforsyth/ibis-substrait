@@ -10,6 +10,7 @@ import collections.abc
 import datetime
 import decimal
 import functools
+import itertools
 import operator
 import uuid
 from typing import Any, Mapping, MutableMapping, Sequence, TypeVar
@@ -19,6 +20,7 @@ import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 import ibis.expr.schema as sch
 import ibis.expr.types as ir
+import toolz
 from ibis import util
 from packaging import version
 
@@ -199,16 +201,23 @@ def _schema(schema: sch.Schema) -> stt.NamedStruct:
 def _expr(
     expr: ir.Expr,
     compiler: SubstraitCompiler,
+    depth_map: DepthMap | None = None,
     **kwargs: Any,
 ) -> stalg.Expression:
-    return translate(expr.op(), expr, compiler, **kwargs)
+    return translate(
+        expr.op(),
+        expr,
+        compiler,
+        depth_map=depth_map if depth_map is not None else {},
+        **kwargs,
+    )
 
 
 @translate.register(ops.Literal)
 def _literal(
     op: ops.Literal,
     expr: ir.ScalarExpr,
-    compiler: SubstraitCompiler,
+    _: SubstraitCompiler,
     **kwargs: Any,
 ) -> stalg.Expression:
     dtype = expr.type()
@@ -586,19 +595,34 @@ def table_column(
     _: SubstraitCompiler,
     *,
     child_rel_field_offsets: MutableMapping[ops.TableNode, int] | None = None,
+    depth_map: DepthMap,
+    **kwargs,
 ) -> stalg.Expression:
     schema = op.table.schema()
     relative_offset = schema._name_locs[op.name]
     base_offset = (child_rel_field_offsets or {}).get(op.table.op(), 0)
     absolute_offset = base_offset + relative_offset
+
+    table_op = op.table.op()
+
+    if steps_out := depth_map.get(table_op):
+        outer_reference = stalg.Expression.FieldReference.OuterReference(
+            steps_out=steps_out
+        )
+        root_reference = None
+    else:
+        outer_reference = None
+        root_reference = stalg.Expression.FieldReference.RootReference()
+
     return stalg.Expression(
         selection=stalg.Expression.FieldReference(
-            root_reference=stalg.Expression.FieldReference.RootReference(),
             direct_reference=stalg.Expression.ReferenceSegment(
                 struct_field=stalg.Expression.ReferenceSegment.StructField(
                     field=absolute_offset,
                 ),
             ),
+            root_reference=root_reference,
+            outer_reference=outer_reference,
         )
     )
 
@@ -680,25 +704,43 @@ def _get_child_relation_field_offsets(table: ir.TableExpr) -> dict[ops.TableNode
 @translate.register(ops.Selection)
 def selection(
     op: ops.Selection,
-    expr: ir.TableExpr,
+    _: ir.TableExpr,
     compiler: SubstraitCompiler,
+    depth_map: DepthMap,
     child_rel_field_offsets: Mapping[ops.TableNode, int] | None = None,
     **kwargs: Any,
 ) -> stalg.Rel:
-    assert (
-        not child_rel_field_offsets
-    ), "non-empty child_rel_field_offsets passed in to selection translation rule"
-    child_rel_field_offsets = _get_child_relation_field_offsets(op.table)
+    #    assert (
+    #        not child_rel_field_offsets
+    #    ), "non-empty child_rel_field_offsets passed in to selection translation rule"
+    # child_rel_field_offsets = _get_child_relation_field_offsets(op.table)
+
+    child_rel_field_offsets = toolz.merge(
+        child_rel_field_offsets if child_rel_field_offsets is not None else {},
+        _get_child_relation_field_offsets(op.table),
+    )
+
     # source
     relation = translate(
         op.table,
         compiler,
         child_rel_field_offsets=child_rel_field_offsets,
+        depth_map=depth_map,
         **kwargs,
     )
 
     # filter
     if op.predicates:
+        table = op.table
+        outer_ref_tables = [
+            t
+            for t in itertools.chain.from_iterable(
+                expr.op().root_tables() for expr in op.predicates
+            )
+            if not t.equals(table.op())
+        ]
+        for t in outer_ref_tables:
+            depth_map[t] += 1
         relation = stalg.Rel(
             filter=stalg.FilterRel(
                 input=relation,
@@ -706,10 +748,13 @@ def selection(
                     functools.reduce(operator.and_, op.predicates),
                     compiler,
                     child_rel_field_offsets=child_rel_field_offsets,
+                    depth_map=depth_map,
                     **kwargs,
                 ),
             )
         )
+        for t in outer_ref_tables:
+            depth_map[t] -= 1
 
     # projection
     selections = [
@@ -728,6 +773,7 @@ def selection(
                         selection,
                         compiler,
                         child_rel_field_offsets=child_rel_field_offsets,
+                        depth_map=depth_map,
                         **kwargs,
                     )
                     for selection in selections
@@ -745,6 +791,7 @@ def selection(
                         key,
                         compiler,
                         child_rel_field_offsets=child_rel_field_offsets,
+                        depth_map=depth_map,
                         **kwargs,
                     )
                     for key in op.sort_keys
@@ -875,8 +922,9 @@ def set_op(
 @translate.register(ops.Aggregation)
 def aggregation(
     op: ops.Aggregation,
-    expr: ir.TableExpr,
+    _: ir.TableExpr,
     compiler: SubstraitCompiler,
+    depth_map: DepthMap,
     **kwargs: Any,
 ) -> stalg.Rel:
     if op.having:
@@ -884,9 +932,16 @@ def aggregation(
 
     table = op.table
     predicates = op.predicates
+    foreign_tables = frozenset(
+        itertools.chain.from_iterable(pred.op().root_tables() for pred in predicates)
+    ) - frozenset((table.op(),))
+
+    for foreign_table in foreign_tables:
+        depth_map[foreign_table] += 1
     input = translate(
         table.filter(predicates) if predicates else table,
         compiler,
+        depth_map=depth_map,
         **kwargs,
     )
 
@@ -896,23 +951,32 @@ def aggregation(
     # semantically where they belong, but due to ibis storing sort keys in the
     # aggregate class we have to sort first, so ibis will use the correct base
     # table when decompiling
-    if op.sort_keys:
-        sorts = [translate(key, compiler, **kwargs) for key in op.sort_keys]
+    if sort_keys := op.sort_keys:
+        sorts = [
+            translate(key, compiler, depth_map=depth_map, **kwargs) for key in sort_keys
+        ]
         input = stalg.Rel(sort=stalg.SortRel(input=input, sorts=sorts))
 
     aggregate = stalg.AggregateRel(
         input=input,
         groupings=[
             stalg.AggregateRel.Grouping(
-                grouping_expressions=[translate(by, compiler, **kwargs)]
+                grouping_expressions=[
+                    translate(by, compiler, depth_map=depth_map, **kwargs)
+                ]
             )
             for by in op.by
         ],
         measures=[
-            stalg.AggregateRel.Measure(measure=translate(metric, compiler, **kwargs))
+            stalg.AggregateRel.Measure(
+                measure=translate(metric, compiler, depth_map=depth_map, **kwargs)
+            )
             for metric in op.metrics
         ],
     )
+
+    for foreign_table in foreign_tables:
+        depth_map[foreign_table] -= 1
 
     return stalg.Rel(aggregate=aggregate)
 
@@ -992,3 +1056,66 @@ def _extractdatefield(
     scalar_func.arguments.add(enum=stalg.FunctionArgument.Enum(specified=span))
     scalar_func.arguments.extend(arguments)
     return stalg.Expression(scalar_function=scalar_func)
+
+
+@translate.register(ops.TableArrayView)
+def _table_array_view(
+    op: ops.TableArrayView,
+    _: ir.Value,
+    compiler: SubstraitCompiler,
+    **kwargs: Any,
+) -> stalg.Expression:
+    return stalg.Expression(
+        subquery=stalg.Expression.Subquery(
+            scalar=stalg.Expression.Subquery.Scalar(
+                input=translate(op.table, compiler, **kwargs)
+            )
+        )
+    )
+
+
+DepthMap: TypeAlias = MutableMapping[ops.Node, int]
+
+
+@translate.register(ops.ExistsSubquery)
+def _exists_subquery(
+    op: ops.ExistsSubquery,
+    _: ir.Value,
+    compiler: SubstraitCompiler,
+    depth_map: DepthMap,
+    **kwargs: Any,
+) -> stalg.Expression:
+    predicate_op = (
+        stalg.Expression.Subquery.SetPredicate.PredicateOp.PREDICATE_OP_EXISTS
+    )
+    foreign_table = op.foreign_table.op()
+    inputs = set(
+        itertools.chain.from_iterable(pred.root_tables() for pred in op.predicates)
+    )
+    inputs.discard(foreign_table)
+    assert len(inputs) == 1, f"len(inputs) == {len(inputs)}"
+    (input,) = inputs
+
+    # the foreign table is at least one level deeper when translating the child
+    # (non-foreign) table
+    depth_map[foreign_table] += 1
+    tuples = stalg.Rel(
+        filter=stalg.FilterRel(
+            input=input,
+            condition=translate(
+                functools.reduce(operator.and_, op.predicates),
+                compiler,
+                depth_map=depth_map,
+                **kwargs,
+            ),
+        )
+    )
+    depth_map[foreign_table] -= 1
+    return stalg.Expression(
+        subquery=stalg.Expression.Subquery(
+            set_predicate=stalg.Expression.Subquery.SetPredicate(
+                predicate_op=predicate_op,
+                tuples=tuples,
+            )
+        )
+    )

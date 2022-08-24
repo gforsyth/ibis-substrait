@@ -308,3 +308,19 @@ def test_roundtrip_nested_join(compiler, s, r, q):
     plan = compiler.compile(expr)
     (result,) = decompile(plan)
     assert result.equals(expr)
+
+
+def test_correlated_subquery(compiler, q, r, s):
+
+    expr = s.join(r, s.c == r.a).join(q, r.b == q.f)
+
+    subexpr = s.join(r, s.c == r.a)
+    subexpr = subexpr[expr.f == subexpr.d]
+
+    expr = expr.filter(expr.d == subexpr.b.min())
+
+    expr = expr.select(["a", "b", "c", "d", "e", "f"])
+
+    plan = compiler.compile(expr)
+    (result,) = decompile(plan)
+    assert result.equals(expr)

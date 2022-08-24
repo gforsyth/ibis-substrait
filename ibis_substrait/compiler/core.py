@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import itertools
 from typing import Any, Hashable, Iterator
 
@@ -84,9 +85,10 @@ class SubstraitCompiler:
         from .translate import translate
 
         expr_schema = expr.schema()
+        depth_map = collections.defaultdict(int)
         rel = stp.PlanRel(
             root=stalg.RelRoot(
-                input=translate(expr.op(), expr, self),
+                input=translate(expr.op(), expr, self, depth_map=depth_map),
                 names=translate(expr_schema).names,
             )
         )

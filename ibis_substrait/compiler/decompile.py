@@ -688,8 +688,11 @@ class ExpressionDecompiler:
         struct_field: stalg.Expression.ReferenceSegment.StructField,
         field_offsets: Sequence[int],
         children: Sequence[ir.TableExpr | ir.StructValue],
+        steps_out: int | None = None,
     ) -> ir.ValueExpr:
         absolute_offset = struct_field.field
+
+        # breakpoint()
 
         # get the index of the child relation from a sequence of field_offsets
         child_index = bisect.bisect_right(field_offsets, absolute_offset) - 1
@@ -715,6 +718,15 @@ class ExpressionDecompiler:
 
         assert isinstance(ref_variant, stalg.Expression.ReferenceSegment)
 
+        _, ref_root_type = which_one_of(ref, "root_type")
+        assert isinstance(
+            ref_root_type,
+            (
+                stalg.Expression.FieldReference.RootReference,
+                stalg.Expression.FieldReference.OuterReference,
+            ),
+        ), f"decompilation of `{ref_root_type}` references are not yet implemented"
+
         _, struct_field = which_one_of(
             ref_variant,
             "reference_type",
@@ -724,10 +736,12 @@ class ExpressionDecompiler:
             stalg.Expression.ReferenceSegment.StructField,
         )
 
+        steps_out = getattr(ref_root_type, "steps_out", None)
         result = ExpressionDecompiler._decompile_struct_field(
             struct_field,
             field_offsets,
             children,
+            steps_out=steps_out,
         )
 
         while struct_field.HasField("child"):
@@ -784,6 +798,15 @@ class ExpressionDecompiler:
         decompiler: SubstraitDecompiler,
     ) -> ir.ValueExpr:
         return decompile(enum)
+
+    @staticmethod
+    def decompile_subquery(
+        subquery: stalg.Expression.Subquery,
+        children: Sequence[ir.TableExpr],
+        offsets: Sequence[int],
+        decompiler: SubstraitDecompiler,
+    ) -> ir.ValueExpr:
+        return decompile(subquery, children, offsets, decompiler)
 
 
 @decompile.register
@@ -1121,3 +1144,17 @@ def _decompile_literal(msg: stalg.Expression.Literal) -> tuple[T, dt.DataType]:
             f"decompilation of `{literal_type_name}` literals not yet implemented"
         )
     return method(literal)
+
+
+@decompile.register
+def _decompile_subquery(
+    msg: stalg.Expression.Subquery,
+    children: Sequence[ir.TableExpr],
+    field_offsets: Sequence[int],
+    decompiler: SubstraitDecompiler,
+) -> ir.ValueExpr:
+    input = msg.scalar.input
+    decompiler.unnamed_aggregate = True
+    table = decompile(input, decompiler, children)
+    decompiler.unnamed_aggregate = False
+    return table.to_array()
