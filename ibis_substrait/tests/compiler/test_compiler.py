@@ -451,3 +451,12 @@ def test_function_argument_usage(compiler):
     )
 
     assert result.arguments[0] == expected
+
+
+def test_value_op_aggregate(compiler):
+    t = ibis.table([("one", "string"), ("two", "float"), ("three", "int32")], name="t")
+    expr = t.group_by("one").aggregate(mkt_share=t.two.sum() / t.three.sum())
+
+    result = translate(expr, compiler)
+
+    assert result
